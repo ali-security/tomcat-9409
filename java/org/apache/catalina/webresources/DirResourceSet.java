@@ -22,34 +22,23 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.jar.Manifest;
 
 import org.apache.catalina.LifecycleException;
 import org.apache.catalina.WebResource;
-import org.apache.catalina.WebResourceLockSet;
 import org.apache.catalina.WebResourceRoot;
 import org.apache.catalina.WebResourceRoot.ResourceSetType;
-import org.apache.tomcat.util.compat.JreCompat;
 import org.apache.catalina.util.ResourceSet;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
-import org.apache.tomcat.util.http.RequestUtil;
 
 /**
  * Represents a {@link org.apache.catalina.WebResourceSet} based on a directory.
  */
-public class DirResourceSet extends AbstractFileResourceSet implements WebResourceLockSet {
+public class DirResourceSet extends AbstractFileResourceSet {
 
     private static final Log log = LogFactory.getLog(DirResourceSet.class);
-
-    private boolean caseSensitive = true;
-
-    private Map<String,ResourceLock> resourceLocksByPath = new HashMap<>();
-    private Object resourceLocksByPathLock = new Object();
 
     /**
      * A no argument constructor is required for this to work with the digester.
@@ -101,39 +90,28 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
         checkPath(path);
         String webAppMount = getWebAppMount();
         WebResourceRoot root = getRoot();
-        if (isPathMounted(path, webAppMount)) {
-            /*
-             * Lock the path for reading until the WebResource has been constructed. The lock prevents concurrent reads
-             * and writes (e.g. HTTP GET and PUT / DELETE) for the same path causing corruption of the FileResource
-             * where some of the fields are set as if the file exists and some as set as if it does not.
-             */
-            ResourceLock lock = lockForRead(path);
-            try {
-                File f = file(path.substring(webAppMount.length()), false);
-                if (f == null) {
-                    return new EmptyResource(root, path);
-                }
-                if (!f.exists()) {
-                    return new EmptyResource(root, path, f);
-                }
-                if (f.isDirectory() && path.charAt(path.length() - 1) != '/') {
-                    path = path + '/';
-                }
-                return new FileResource(root, path, f, isReadOnly(), getManifest(), this, lock.key);
-            } finally {
-                unlockForRead(lock);
+        if (path.startsWith(webAppMount)) {
+            File f = file(path.substring(webAppMount.length()), false);
+            if (f == null) {
+                return new EmptyResource(root, path);
             }
+            if (!f.exists()) {
+                return new EmptyResource(root, path, f);
+            }
+            if (f.isDirectory() && path.charAt(path.length() - 1) != '/') {
+                path = path + '/';
+            }
+            return new FileResource(root, path, f, isReadOnly(), getManifest());
         } else {
             return new EmptyResource(root, path);
         }
     }
 
-
     @Override
     public String[] list(String path) {
         checkPath(path);
         String webAppMount = getWebAppMount();
-        if (isPathMounted(path, webAppMount)) {
+        if (path.startsWith(webAppMount)) {
             File f = file(path.substring(webAppMount.length()), true);
             if (f == null) {
                 return EMPTY_STRING_ARRAY;
@@ -165,7 +143,7 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
         checkPath(path);
         String webAppMount = getWebAppMount();
         ResourceSet<String> result = new ResourceSet<>();
-        if (isPathMounted(path, webAppMount)) {
+        if (path.startsWith(webAppMount)) {
             File f = file(path.substring(webAppMount.length()), true);
             if (f != null) {
                 File[] list = f.listFiles();
@@ -239,7 +217,7 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
             return false;
         }
         String webAppMount = getWebAppMount();
-        if (isPathMounted(path, webAppMount)) {
+        if (path.startsWith(webAppMount)) {
             File f = file(path.substring(webAppMount.length()), false);
             if (f == null) {
                 return false;
@@ -268,40 +246,32 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
             return false;
         }
 
-        String webAppMount = getWebAppMount();
-        if (!isPathMounted(path, webAppMount)) {
-            return false;
-        }
-
         File dest = null;
-        /*
-         * Lock the path for writing until the write is complete. The lock prevents concurrent reads and writes (e.g.
-         * HTTP GET and PUT / DELETE) for the same path causing corruption of the FileResource where some of the fields
-         * are set as if the file exists and some as set as if it does not.
-         */
-        ResourceLock lock = lockForWrite(path);
-        try {
+        String webAppMount = getWebAppMount();
+        if (path.startsWith(webAppMount)) {
             dest = file(path.substring(webAppMount.length()), false);
             if (dest == null) {
                 return false;
             }
-            if (dest.exists() && !overwrite) {
-                return false;
-            }
-
-            try {
-                if (overwrite) {
-                    Files.copy(is, dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                } else {
-                    Files.copy(is, dest.toPath());
-                }
-            } catch (IOException ioe) {
-                return false;
-            }
-            return true;
-        } finally {
-            unlockForWrite(lock);
+        } else {
+            return false;
         }
+
+        if (dest.exists() && !overwrite) {
+            return false;
+        }
+
+        try {
+            if (overwrite) {
+                Files.copy(is, dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            } else {
+                Files.copy(is, dest.toPath());
+            }
+        } catch (IOException ioe) {
+            return false;
+        }
+
+        return true;
     }
 
     @Override
@@ -316,7 +286,6 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
     @Override
     protected void initInternal() throws LifecycleException {
         super.initInternal();
-        caseSensitive = isCaseSensitive();
         // Is this an exploded web application?
         if (getWebAppMount().equals("")) {
             // Look for a manifest
@@ -327,145 +296,6 @@ public class DirResourceSet extends AbstractFileResourceSet implements WebResour
                 } catch (IOException e) {
                     log.warn(sm.getString("dirResourceSet.manifestFail", mf.getAbsolutePath()), e);
                 }
-            }
-        }
-        // Check for exposure to CVE-2024-56337
-        if (caseSensitive) {
-            // CVE-2024-56337 (nor CVE-2024-50379) is not exploitable on a case sensitive file system
-            return;
-        }
-        if (isReadOnly()) {
-            // CVE-2024-56337 (nor CVE-2024-50379) is not exploitable on a read-only ResourceSet
-            return;
-        }
-        if (JreCompat.getInstance().isCanonCachesDisabled()) {
-            // CVE-2024-56337 (nor CVE-2024-50379) is not exploitable if the canonical file name cache is disabled
-            return;
-        }
-        // This ResourceSet may be exposed to CVE-2024-56337.
-        if (JreCompat.getInstance().disableCanonCaches()) {
-            /*
-             * The canonical file name cache was enabled and is now disabled.
-             */
-            log.warn(sm.getString("dirResourceSet.canonCaches.disabled", getFileBase(),
-                    getRoot().getContext().getName()));
-        } else {
-            /*
-             * The canonical file name cache could not be disabled (or Tomcat cannot confirm it has been disabled). This
-             * ResourceSet may be exposed to CVE-2024-56337.
-             */
-            throw new IllegalStateException(sm.getString("dirResourceSet.canonCaches.enabled", getFileBase(),
-                    getRoot().getContext().getName()));
-        }
-    }
-
-    /*
-     * Determines if this ResourceSet is based on a case sensitive file system or not.
-     */
-    private boolean isCaseSensitive() {
-        try {
-            String canonicalPath = getFileBase().getCanonicalPath();
-            File upper = new File(canonicalPath.toUpperCase(Locale.ENGLISH));
-            if (!canonicalPath.equals(upper.getCanonicalPath())) {
-                return true;
-            }
-            File lower = new File(canonicalPath.toLowerCase(Locale.ENGLISH));
-            if (!canonicalPath.equals(lower.getCanonicalPath())) {
-                return true;
-            }
-            /*
-             * Both upper and lower case versions of the current fileBase have the same canonical path so the file
-             * system must be case insensitive.
-             */
-        } catch (IOException ioe) {
-            log.warn(sm.getString("dirResourceSet.isCaseSensitive.fail", getFileBase().getAbsolutePath()), ioe);
-        }
-
-        return false;
-    }
-
-
-    private String getLockKey(String path) {
-        // Normalize path to ensure that the same key is used for the same path.
-        String normalisedPath = RequestUtil.normalize(path);
-        if (caseSensitive) {
-            return normalisedPath;
-        }
-        return normalisedPath.toLowerCase(Locale.ENGLISH);
-    }
-
-
-    @Override
-    public ResourceLock lockForRead(String path) {
-        String key = getLockKey(path);
-        ResourceLock resourceLock = null;
-        synchronized (resourceLocksByPathLock) {
-            /*
-             * Obtain the ResourceLock and increment the usage count inside the sync to ensure that that map always has
-             * a consistent view of the currently "in-use" ResourceLocks.
-             */
-            resourceLock = resourceLocksByPath.get(key);
-            if (resourceLock == null) {
-                resourceLock = new ResourceLock(key);
-                resourceLocksByPath.put(key, resourceLock);
-            }
-            resourceLock.count.incrementAndGet();
-        }
-        // Obtain the lock outside the sync as it will block if there is a current write lock.
-        resourceLock.reentrantLock.readLock().lock();
-        return resourceLock;
-    }
-
-
-    @Override
-    public void unlockForRead(ResourceLock resourceLock) {
-        // Unlock outside the sync as there is no need to do it inside.
-        resourceLock.reentrantLock.readLock().unlock();
-        synchronized (resourceLocksByPathLock) {
-            /*
-             * Decrement the usage count and remove ResourceLocks no longer required inside the sync to ensure that that
-             * map always has a consistent view of the currently "in-use" ResourceLocks.
-             */
-            if (resourceLock.count.decrementAndGet() == 0) {
-                resourceLocksByPath.remove(resourceLock.key);
-            }
-        }
-    }
-
-
-    @Override
-    public ResourceLock lockForWrite(String path) {
-        String key = getLockKey(path);
-        ResourceLock resourceLock = null;
-        synchronized (resourceLocksByPathLock) {
-            /*
-             * Obtain the ResourceLock and increment the usage count inside the sync to ensure that that map always has
-             * a consistent view of the currently "in-use" ResourceLocks.
-             */
-            resourceLock = resourceLocksByPath.get(key);
-            if (resourceLock == null) {
-                resourceLock = new ResourceLock(key);
-                resourceLocksByPath.put(key, resourceLock);
-            }
-            resourceLock.count.incrementAndGet();
-        }
-        // Obtain the lock outside the sync as it will block if there are any other current locks.
-        resourceLock.reentrantLock.writeLock().lock();
-        return resourceLock;
-    }
-
-
-    @Override
-    public void unlockForWrite(ResourceLock resourceLock) {
-        // Unlock outside the sync as there is no need to do it inside.
-        resourceLock.reentrantLock.writeLock().unlock();
-        synchronized (resourceLocksByPathLock) {
-            /*
-             * Decrement the usage count and remove ResourceLocks no longer required inside the sync to ensure that that
-             * map always has a consistent view of the currently "in-use" ResourceLocks.
-             */
-            if (resourceLock.count.decrementAndGet() == 0) {
-                resourceLocksByPath.remove(resourceLock.key);
             }
         }
     }
